@@ -1,0 +1,15 @@
+name: VoidOptimize
+version: 1.0.0
+main: com.voidoptimize.VoidOptimize
+api-version: '1.21'
+author: Ludovico
+website: https://github.com/ludovicoflaviano-netizen/VoidOptimize
+description: Safe server optimization without destructive entity clearing.
+commands:
+  voidoptimize:
+    description: View optimizer status and memory information.
+    usage: /voidoptimize [status|reload]
+    permission: voidoptimize.admin
+permissions:
+  voidoptimize.admin:
+    default: op

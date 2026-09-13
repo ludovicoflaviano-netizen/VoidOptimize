@@ -1,0 +1,25 @@
+# VoidOptimize configuration
+# This plugin intentionally does NOT run System.gc() and does NOT clear normal entities/items.
+
+performance:
+  # How often the lightweight metrics sampler runs.
+  sample-interval-ticks: 20
+  # Keep a tiny rolling sample window. Lower values use less memory.
+  sample-window: 60
+
+protection:
+  # Never remove these projectile entities if a future cleanup module is enabled.
+  protected-entity-types:
+    - ENDER_PEARL
+    - WIND_CHARGE
+    - BREEZE_WIND_CHARGE
+
+cleanup:
+  # Disabled by default. No item/entity trash collection is performed.
+  enabled: false
+  # If enabled later, only entities explicitly listed here may be considered.
+  allowed-entity-types: []
+
+memory:
+  # Only report JVM memory. No forced garbage collection is performed.
+  metrics: true
