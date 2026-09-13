@@ -1,10 +1,12 @@
-# VoidOptimize - conservative Paper 1.21.11 optimization
-# Never deletes gameplay entities and never forces System.gc().
+# VoidOptimize - adaptive Paper 1.21.11 optimization
+# This plugin never deletes gameplay entities, never forces GC, and never disables the Paper watchdog.
 
 culling:
   enabled: true
   interval-ticks: 10
   max-entities-per-pass: 300
+  min-adaptive-entities: 75
+  max-adaptive-entities: 600
   player-radius: 32
 
 performance:
@@ -12,6 +14,8 @@ performance:
   sample-interval-ticks: 20
   emergency-mspt: 45.0
   resume-mspt: 35.0
+  aggressive-mspt: 25.0
+  conservative-mspt: 38.0
 
 chunks:
   prefetch:
@@ -21,7 +25,7 @@ chunks:
     max-requests-per-pass: 4
     max-in-flight: 16
     max-mspt: 35.0
-    # false is safest. true can generate new chunks ahead of players and costs CPU.
+    directional: true
     generate-new-chunks: false
 
 protection:

@@ -11,6 +11,7 @@ import org.bukkit.plugin.java.JavaPlugin;
 
 import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryUsage;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -22,39 +23,53 @@ public final class VoidOptimize extends JavaPlugin {
     private int optimizerTask = -1, metricsTask = -1;
     private int intervalTicks, maxEntitiesPerPass, radius, sampleIntervalTicks;
     private int chunkPrefetchIntervalTicks, chunkPrefetchRadius, maxChunkRequestsPerPass, maxChunkRequestsInFlight;
-    private double emergencyMspt, resumeMspt, chunkPrefetchMaxMspt;
+    private int minAdaptiveEntities, maxAdaptiveEntities;
+    private double emergencyMspt, resumeMspt, chunkPrefetchMaxMspt, aggressiveMspt, conservativeMspt;
     private boolean cullingEnabled, metricsEnabled, adaptiveEnabled, projectileProtection;
-    private boolean chunkPrefetchEnabled, chunkGenerationEnabled;
+    private boolean chunkPrefetchEnabled, chunkGenerationEnabled, directionalPrefetch;
     private final Set<String> protectedTypes = new HashSet<>();
     private final Set<String> chunksInFlight = ConcurrentHashMap.newKeySet();
+    private final ConcurrentHashMap<UUID, Long> lastPlayerChunk = new ConcurrentHashMap<>();
     private long lastTickNanos, totalPassNanos, lastPassNanos, passes, entitiesInspected, protectedSeen;
     private long skippedForLoad, chunkRequests, chunkCompletions, chunkFailures, lastChunkPrefetchNanos;
+    private long adaptiveReductions, adaptiveExpansions;
     private double lastMspt;
     private boolean emergencyMode;
 
     @Override public void onEnable() {
-        saveDefaultConfig(); loadSettings(); lastTickNanos = System.nanoTime(); startTasks();
-        getLogger().info("VoidOptimize enabled: adaptive culling, guarded chunk prefetch, and overload protection.");
+        saveDefaultConfig();
+        loadSettings();
+        lastTickNanos = System.nanoTime();
+        startTasks();
+        getLogger().info("VoidOptimize enabled: adaptive workload control, guarded chunk prefetch, and overload protection.");
     }
+
     @Override public void onDisable() {
         if (optimizerTask != -1) Bukkit.getScheduler().cancelTask(optimizerTask);
         if (metricsTask != -1) Bukkit.getScheduler().cancelTask(metricsTask);
-        optimizerTask = metricsTask = -1; chunksInFlight.clear();
+        optimizerTask = metricsTask = -1;
+        chunksInFlight.clear();
+        lastPlayerChunk.clear();
     }
 
     private void loadSettings() {
         intervalTicks = clamp(getConfig().getInt("culling.interval-ticks", 10), 2, 200);
         maxEntitiesPerPass = clamp(getConfig().getInt("culling.max-entities-per-pass", 300), 25, 10000);
         radius = clamp(getConfig().getInt("culling.player-radius", 32), 8, 128);
+        minAdaptiveEntities = clamp(getConfig().getInt("culling.min-adaptive-entities", 75), 25, maxEntitiesPerPass);
+        maxAdaptiveEntities = clamp(getConfig().getInt("culling.max-adaptive-entities", maxEntitiesPerPass), minAdaptiveEntities, 10000);
         sampleIntervalTicks = clamp(getConfig().getInt("performance.sample-interval-ticks", 20), 5, 200);
         emergencyMspt = clampDouble(getConfig().getDouble("performance.emergency-mspt", 45.0), 20.0, 100.0);
         resumeMspt = clampDouble(getConfig().getDouble("performance.resume-mspt", 35.0), 15.0, emergencyMspt);
+        aggressiveMspt = clampDouble(getConfig().getDouble("performance.aggressive-mspt", 25.0), 10.0, 40.0);
+        conservativeMspt = clampDouble(getConfig().getDouble("performance.conservative-mspt", 38.0), aggressiveMspt, 60.0);
         cullingEnabled = getConfig().getBoolean("culling.enabled", true);
         metricsEnabled = getConfig().getBoolean("memory.metrics", true);
         adaptiveEnabled = getConfig().getBoolean("performance.adaptive", true);
         projectileProtection = getConfig().getBoolean("protection.enabled", true);
         chunkPrefetchEnabled = getConfig().getBoolean("chunks.prefetch.enabled", true);
         chunkGenerationEnabled = getConfig().getBoolean("chunks.prefetch.generate-new-chunks", false);
+        directionalPrefetch = getConfig().getBoolean("chunks.prefetch.directional", true);
         chunkPrefetchIntervalTicks = clamp(getConfig().getInt("chunks.prefetch.interval-ticks", 10), 2, 200);
         chunkPrefetchRadius = clamp(getConfig().getInt("chunks.prefetch.radius", 1), 1, 3);
         maxChunkRequestsPerPass = clamp(getConfig().getInt("chunks.prefetch.max-requests-per-pass", 4), 1, 32);
@@ -79,18 +94,29 @@ public final class VoidOptimize extends JavaPlugin {
         long start = System.nanoTime();
         if (cullingEnabled) runSafeCulling();
         if (chunkPrefetchEnabled && shouldPrefetchChunks()) runChunkPrefetch();
-        lastPassNanos = System.nanoTime() - start; totalPassNanos += lastPassNanos; passes++;
+        lastPassNanos = System.nanoTime() - start;
+        totalPassNanos += lastPassNanos;
+        passes++;
+    }
+
+    private int adaptiveBudget() {
+        if (!adaptiveEnabled) return maxEntitiesPerPass;
+        if (lastMspt >= conservativeMspt) return Math.max(minAdaptiveEntities, maxEntitiesPerPass / 3);
+        if (lastMspt >= aggressiveMspt) return Math.max(minAdaptiveEntities, (int)(maxEntitiesPerPass * 0.60));
+        if (lastMspt <= aggressiveMspt * 0.70) return Math.min(maxAdaptiveEntities, (int)(maxEntitiesPerPass * 1.25));
+        return maxEntitiesPerPass;
     }
 
     private void runSafeCulling() {
-        int budget = maxEntitiesPerPass;
+        int budget = adaptiveBudget();
+        if (budget < maxEntitiesPerPass) adaptiveReductions++;
+        else if (budget > maxEntitiesPerPass) adaptiveExpansions++;
         for (Player player : Bukkit.getOnlinePlayers()) {
-            if (budget <= 0) break;
-            if (!player.isOnline() || player.isDead()) continue;
+            if (budget <= 0 || !player.isOnline() || player.isDead()) break;
             List<Entity> nearby;
             try { nearby = player.getNearbyEntities(radius, radius, radius); } catch (Throwable ignored) { continue; }
             for (Entity entity : nearby) {
-                if (budget-- <= 0) break;
+                if (budget-- <= 0) return;
                 if (!entity.isValid()) continue;
                 entitiesInspected++;
                 if (projectileProtection && isProtected(entity)) protectedSeen++;
@@ -100,29 +126,49 @@ public final class VoidOptimize extends JavaPlugin {
 
     private boolean shouldPrefetchChunks() {
         if (emergencyMode || Bukkit.getOnlinePlayers().isEmpty()) return false;
-        if (System.nanoTime() - lastChunkPrefetchNanos < chunkPrefetchIntervalTicks * 50_000_000L) return false;
+        long now = System.nanoTime();
+        if (now - lastChunkPrefetchNanos < chunkPrefetchIntervalTicks * 50_000_000L) return false;
         return lastMspt <= chunkPrefetchMaxMspt && chunksInFlight.size() < maxChunkRequestsInFlight;
     }
 
     private void runChunkPrefetch() {
-        int requested = 0; lastChunkPrefetchNanos = System.nanoTime();
+        lastChunkPrefetchNanos = System.nanoTime();
+        int requested = 0;
         for (Player player : Bukkit.getOnlinePlayers()) {
-            if (requested >= maxChunkRequestsPerPass) break;
+            if (requested >= maxChunkRequestsPerPass || chunksInFlight.size() >= maxChunkRequestsInFlight) break;
             if (!player.isOnline() || player.isDead()) continue;
             World world = player.getWorld();
-            int cx = player.getLocation().getBlockX() >> 4, cz = player.getLocation().getBlockZ() >> 4;
-            outer: for (int dx = -chunkPrefetchRadius; dx <= chunkPrefetchRadius; dx++) {
-                for (int dz = -chunkPrefetchRadius; dz <= chunkPrefetchRadius; dz++) {
-                    if (requested >= maxChunkRequestsPerPass || chunksInFlight.size() >= maxChunkRequestsInFlight) break outer;
-                    if (dx == 0 && dz == 0) continue;
-                    int x = cx + dx, z = cz + dz; String key = world.getUID() + ":" + x + ":" + z;
-                    if (!chunksInFlight.add(key)) continue;
-                    try {
-                        world.getChunkAtAsync(x, z, chunkGenerationEnabled, false).whenComplete((chunk, error) -> {
-                            chunksInFlight.remove(key); if (error == null) chunkCompletions++; else chunkFailures++;
-                        });
-                        chunkRequests++; requested++;
-                    } catch (Throwable ignored) { chunksInFlight.remove(key); chunkFailures++; }
+            int cx = player.getLocation().getBlockX() >> 4;
+            int cz = player.getLocation().getBlockZ() >> 4;
+            long previous = lastPlayerChunk.getOrDefault(player.getUniqueId(), Long.MIN_VALUE);
+            long current = packChunk(cx, cz);
+            if (previous == current && directionalPrefetch) continue;
+            lastPlayerChunk.put(player.getUniqueId(), current);
+            int dx = Integer.compare(player.getLocation().getBlockX() - (cx << 4) - 8, 0);
+            int dz = Integer.compare(player.getLocation().getBlockZ() - (cz << 4) - 8, 0);
+            List<int[]> candidates = new ArrayList<>();
+            if (directionalPrefetch) {
+                if (dx != 0) candidates.add(new int[]{cx + dx, cz});
+                if (dz != 0) candidates.add(new int[]{cx, cz + dz});
+            }
+            candidates.add(new int[]{cx + 1, cz}); candidates.add(new int[]{cx - 1, cz});
+            candidates.add(new int[]{cx, cz + 1}); candidates.add(new int[]{cx, cz - 1});
+            for (int d = 1; d <= chunkPrefetchRadius && requested < maxChunkRequestsPerPass; d++) {
+                candidates.add(new int[]{cx + d, cz}); candidates.add(new int[]{cx - d, cz});
+                candidates.add(new int[]{cx, cz + d}); candidates.add(new int[]{cx, cz - d});
+            }
+            for (int[] c : candidates) {
+                if (requested >= maxChunkRequestsPerPass || chunksInFlight.size() >= maxChunkRequestsInFlight) break;
+                String key = world.getUID() + ":" + c[0] + ":" + c[1];
+                if (!chunksInFlight.add(key)) continue;
+                try {
+                    world.getChunkAtAsync(c[0], c[1], chunkGenerationEnabled, false).whenComplete((chunk, error) -> {
+                        chunksInFlight.remove(key);
+                        if (error == null) chunkCompletions++; else chunkFailures++;
+                    });
+                    chunkRequests++; requested++;
+                } catch (Throwable ignored) {
+                    chunksInFlight.remove(key); chunkFailures++;
                 }
             }
         }
@@ -135,40 +181,40 @@ public final class VoidOptimize extends JavaPlugin {
     }
 
     private void samplePerformance() {
-        long now = System.nanoTime(), elapsed = Math.max(1L, now - lastTickNanos); lastTickNanos = now;
-        try {
-            double[] tps = Bukkit.getTPS();
-            lastMspt = tps.length > 0 && tps[0] > 0.0 ? 1000.0 / Math.min(20.0, tps[0]) : elapsed / 1_000_000.0 / Math.max(1, sampleIntervalTicks);
-        } catch (Throwable ignored) { lastMspt = elapsed / 1_000_000.0 / Math.max(1, sampleIntervalTicks); }
+        long now = System.nanoTime();
+        long elapsed = Math.max(1L, now - lastTickNanos);
+        lastTickNanos = now;
+        double[] tps;
+        try { tps = Bukkit.getTPS(); } catch (Throwable ignored) { tps = new double[0]; }
+        lastMspt = tps.length > 0 && tps[0] > 0.0 ? 1000.0 / Math.min(20.0, tps[0]) : elapsed / 1_000_000.0 / Math.max(1, sampleIntervalTicks);
         updateEmergencyState();
     }
 
     public boolean isProtectedProjectile(String type) { return projectileProtection && type != null && protectedTypes.contains(type.toUpperCase(Locale.ROOT)); }
     private boolean isProtected(Entity entity) { return isProtectedProjectile(entity.getType().name()); }
-
+    private long packChunk(int x, int z) { return ((long)x << 32) ^ (z & 0xffffffffL); }
     private String memoryText() { Runtime r = Runtime.getRuntime(); return formatBytes(r.totalMemory() - r.freeMemory()) + " / " + formatBytes(r.maxMemory()); }
     private String heapText() { MemoryUsage h = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage(); return formatBytes(h.getUsed()) + " / " + formatBytes(h.getCommitted()); }
-    private String formatBytes(long b) { double v = b; String[] u = {"B","KB","MB","GB"}; int i = 0; while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; } return String.format(Locale.ROOT, "%.1f %s", v, u[i]); }
+    private String formatBytes(long bytes) { double v = bytes; String[] u={"B","KB","MB","GB"}; int i=0; while(v>=1024 && i<u.length-1){v/=1024;i++;} return String.format(Locale.ROOT,"%.1f %s",v,u[i]); }
     private double averagePassMs() { return passes == 0 ? 0.0 : totalPassNanos / 1_000_000.0 / passes; }
-    private int loadedChunks() { int n = 0; for (World w : Bukkit.getWorlds()) n += w.getLoadedChunks().length; return n; }
-    private int entityCount() { int n = 0; for (World w : Bukkit.getWorlds()) n += w.getEntities().size(); return n; }
+    private int loadedChunks() { int n=0; for(World w:Bukkit.getWorlds()) n += w.getLoadedChunks().length; return n; }
+    private int entityCount() { int n=0; for(World w:Bukkit.getWorlds()) n += w.getEntities().size(); return n; }
 
     private void sendStatus(CommandSender s) {
         s.sendMessage(ChatColor.GOLD + "VoidOptimize " + ChatColor.GRAY + "status");
         s.sendMessage(ChatColor.GRAY + "Players: " + ChatColor.WHITE + Bukkit.getOnlinePlayers().size() + ChatColor.GRAY + " | Entities: " + ChatColor.WHITE + entityCount());
         s.sendMessage(ChatColor.GRAY + "Loaded chunks: " + ChatColor.WHITE + loadedChunks() + ChatColor.GRAY + " | Memory: " + ChatColor.WHITE + memoryText());
-        s.sendMessage(ChatColor.GRAY + "Heap: " + ChatColor.WHITE + heapText() + ChatColor.GRAY + " | MSPT estimate: " + ChatColor.WHITE + String.format(Locale.ROOT, "%.2f ms", lastMspt));
-        s.sendMessage(ChatColor.GRAY + "Emergency: " + (emergencyMode ? ChatColor.RED + "ON" : ChatColor.GREEN + "OFF") + ChatColor.GRAY + " | Culling: " + (cullingEnabled ? ChatColor.GREEN + "ON" : ChatColor.RED + "OFF") + ChatColor.GRAY + " | Prefetch: " + (chunkPrefetchEnabled ? ChatColor.GREEN + "ON" : ChatColor.RED + "OFF"));
-        s.sendMessage(ChatColor.GRAY + "Passes: " + ChatColor.WHITE + passes + ChatColor.GRAY + " | Avg pass: " + ChatColor.WHITE + String.format(Locale.ROOT, "%.3f ms", averagePassMs()) + ChatColor.GRAY + " | Load skips: " + ChatColor.WHITE + skippedForLoad);
-        s.sendMessage(ChatColor.GRAY + "Chunk requests: " + ChatColor.WHITE + chunkRequests + ChatColor.GRAY + " | completed: " + ChatColor.WHITE + chunkCompletions + ChatColor.GRAY + " | failed: " + ChatColor.WHITE + chunkFailures);
+        s.sendMessage(ChatColor.GRAY + "Heap: " + ChatColor.WHITE + heapText() + ChatColor.GRAY + " | MSPT: " + ChatColor.WHITE + String.format(Locale.ROOT,"%.2f ms",lastMspt));
+        s.sendMessage(ChatColor.GRAY + "Emergency: " + (emergencyMode ? ChatColor.RED + "ACTIVE" : ChatColor.GREEN + "READY") + ChatColor.GRAY + " | Budget: " + ChatColor.WHITE + adaptiveBudget());
+        s.sendMessage(ChatColor.GRAY + "Prefetch queue: " + ChatColor.WHITE + chunksInFlight.size() + ChatColor.GRAY + " / " + maxChunkRequestsInFlight + " | Requests: " + chunkRequests + " | Failed: " + chunkFailures);
     }
 
     private void sendProfile(CommandSender s) {
         s.sendMessage(ChatColor.GOLD + "VoidOptimize " + ChatColor.GRAY + "profile");
-        s.sendMessage(ChatColor.GRAY + "Last pass: " + ChatColor.WHITE + String.format(Locale.ROOT, "%.3f ms", lastPassNanos / 1_000_000.0) + ChatColor.GRAY + " | Average: " + ChatColor.WHITE + String.format(Locale.ROOT, "%.3f ms", averagePassMs()));
-        s.sendMessage(ChatColor.GRAY + "Entities inspected: " + ChatColor.WHITE + entitiesInspected + ChatColor.GRAY + " | Protected observed: " + ChatColor.WHITE + protectedSeen);
-        s.sendMessage(ChatColor.GRAY + "Chunk queue: " + ChatColor.WHITE + chunksInFlight.size() + ChatColor.GRAY + " / " + maxChunkRequestsInFlight + " | Requests: " + ChatColor.WHITE + chunkRequests);
-        s.sendMessage(ChatColor.GRAY + "Adaptive emergency mode: " + (emergencyMode ? ChatColor.RED + "ACTIVE" : ChatColor.GREEN + "READY"));
+        s.sendMessage(ChatColor.GRAY + "Last pass: " + ChatColor.WHITE + String.format(Locale.ROOT,"%.3f ms",lastPassNanos/1_000_000.0) + ChatColor.GRAY + " | Average: " + ChatColor.WHITE + String.format(Locale.ROOT,"%.3f ms",averagePassMs()));
+        s.sendMessage(ChatColor.GRAY + "Passes: " + ChatColor.WHITE + passes + ChatColor.GRAY + " | Inspected: " + entitiesInspected + ChatColor.GRAY + " | Protected: " + protectedSeen);
+        s.sendMessage(ChatColor.GRAY + "Load skips: " + ChatColor.WHITE + skippedForLoad + ChatColor.GRAY + " | Adaptive reductions: " + adaptiveReductions + ChatColor.GRAY + " | Expansions: " + adaptiveExpansions);
+        s.sendMessage(ChatColor.GRAY + "Chunks completed: " + ChatColor.WHITE + chunkCompletions + ChatColor.GRAY + " | Failed: " + chunkFailures);
     }
 
     @Override public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
@@ -183,6 +229,7 @@ public final class VoidOptimize extends JavaPlugin {
         }
         return true;
     }
-    private static int clamp(int v, int min, int max) { return Math.max(min, Math.min(max, v)); }
-    private static double clampDouble(double v, double min, double max) { return Math.max(min, Math.min(max, v)); }
+
+    private static int clamp(int v,int min,int max){return Math.max(min,Math.min(max,v));}
+    private static double clampDouble(double v,double min,double max){return Math.max(min,Math.min(max,v));}
 }

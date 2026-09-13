@@ -1,25 +1,24 @@
 # VoidOptimize
 
-VoidOptimize is a conservative Paper 1.21.11 optimizer. It focuses on reducing its own CPU cost, smoothing bursty chunk requests, bounding work, and backing off during overload without deleting gameplay entities or changing core Minecraft mechanics.
+VoidOptimize is a conservative Paper 1.21.11 performance plugin designed to reduce its own overhead, smooth chunk requests, and back off automatically when the server is under load.
 
 ## Optimization layers
 
-- Player-local workload culling with a hard per-pass entity budget.
-- Adaptive emergency mode. When measured MSPT becomes unhealthy, non-essential optimizer work stops until the server recovers.
-- Bounded asynchronous chunk prefetch around active players using Paper's async chunk API.
-- Small in-flight and per-pass chunk limits prevent a chunk-load storm.
-- Optional new-chunk generation prefetch is disabled by default because generation itself is expensive.
-- Low-overhead memory and heap metrics.
-- Ender pearls, wind charges, and breeze wind charges are protected.
-- No forced GC, item deletion, mob deletion, chunk unloading, AI disabling, redstone changes, combat changes, or farm-breaking cleanup.
+- Adaptive workload budgeting: the plugin changes its own scan budget from measured MSPT instead of running a fixed workload at all times.
+- Emergency backoff: when the measured MSPT is unhealthy, plugin work pauses until the server recovers.
+- Direction-aware chunk prefetch: when players move into a new chunk, nearby chunks are requested first so exploration can feel smoother.
+- Strict chunk request limits: both per-pass and in-flight limits prevent the plugin from creating a chunk-loading storm.
+- No new-chunk generation by default: generation can be enabled manually, but it is CPU/storage intensive.
+- Low-overhead metrics: memory, heap, MSPT, queue depth, and optimizer timings are available without forced garbage collection.
+- Projectile protection: ender pearls, wind charges, and breeze wind charges remain protected.
 
-## Faster chunk loading
+## What it does not do
 
-The plugin cannot make chunk generation itself infinitely faster. It can reduce the visible cost of exploration by requesting nearby chunks ahead of the player while the server is healthy. Paper controls the actual asynchronous loading speed. New-chunk generation is therefore disabled by default; enable it only after testing the hardware and world workload.
+This plugin does not delete items or mobs, disable mob AI, unload chunks blindly, alter redstone, change random tick speed, force GC, or disable the Paper watchdog. Those approaches can break farms/gameplay or make failure modes worse.
 
-## Freeze and crash protection
+The plugin cannot make chunk generation infinitely faster. Paper controls the actual asynchronous chunk-loading pipeline; the plugin improves perceived exploration by requesting safe nearby chunks ahead of players. Paper's API explicitly provides asynchronous chunk loading for work that does not need an immediate chunk and lets the server control the load speed.
 
-The optimizer protects the server from additional optimizer-induced overload by using strict budgets and emergency backoff. It does not disable or bypass the Paper watchdog, and it cannot guarantee that a server will never freeze or crash. World corruption, JVM memory exhaustion, broken plugins, operating-system limits, and extreme chunk generation can still cause failures.
+For server-wide optimization, also tune Paper's own configuration. For example, Paper exposes chunk-system IO/worker thread controls and server-side view distance/entity broadcast settings. These should be tuned for the actual CPU, storage, player count, and world workload rather than blindly maximized.
 
 ## Commands
 
@@ -29,8 +28,6 @@ The optimizer protects the server from additional optimizer-induced overload by 
 
 Permission: `voidoptimize.admin`
 
-## Configuration
+## Important
 
-The safe defaults are designed for normal survival/SMP gameplay. Increase chunk prefetch only when profiling shows that the server has spare CPU capacity. Do not use aggressive chunk generation on low-end hardware.
-
-For the best overall result, also tune Paper's own view distance, simulation distance, chunk system, entity activation, JVM heap, and storage. A plugin cannot safely replace all server-level and JVM optimizations with one universal setting.
+There is no honest way to guarantee "100% optimization" or zero freezes/crashes. Performance depends on hardware, JVM memory, Paper configuration, plugins, datapacks, world generation, storage latency, and player behavior. This project aims for maximum safe optimization without changing core gameplay.
