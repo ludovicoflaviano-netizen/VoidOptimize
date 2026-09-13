@@ -1,16 +1,28 @@
 # VoidOptimize - conservative Paper 1.21.11 optimization
-# No forced garbage collection and no destructive entity clearing.
+# Never deletes gameplay entities and never forces System.gc().
 
 culling:
   enabled: true
-  interval-ticks: 20
-  max-entities-per-pass: 200
+  interval-ticks: 10
+  max-entities-per-pass: 300
   player-radius: 32
 
 performance:
   adaptive: true
   sample-interval-ticks: 20
-  backoff-mspt: 45.0
+  emergency-mspt: 45.0
+  resume-mspt: 35.0
+
+chunks:
+  prefetch:
+    enabled: true
+    interval-ticks: 10
+    radius: 1
+    max-requests-per-pass: 4
+    max-in-flight: 16
+    max-mspt: 35.0
+    # false is safest. true can generate new chunks ahead of players and costs CPU.
+    generate-new-chunks: false
 
 protection:
   enabled: true
