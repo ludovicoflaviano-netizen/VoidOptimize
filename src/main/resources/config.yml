@@ -1,18 +1,18 @@
-# VoidOptimize 1.4.0
+# VoidOptimize 1.5.0
 culling:
   enabled: true
-  interval-ticks: 10
-  max-entities-per-pass: 300
-  min-adaptive-entities: 75
-  max-adaptive-entities: 600
-  player-radius: 32
+  interval-ticks: 20
+  max-entities-per-pass: 200
+  min-adaptive-entities: 50
+  max-adaptive-entities: 400
+  player-radius: 24
 performance:
   adaptive: true
   sample-interval-ticks: 20
   emergency-mspt: 45.0
-  resume-mspt: 35.0
+  resume-mspt: 32.0
   aggressive-mspt: 25.0
-  conservative-mspt: 38.0
+  conservative-mspt: 36.0
 chunks:
   prefetch:
     enabled: true
@@ -20,7 +20,7 @@ chunks:
     radius: 1
     max-requests-per-pass: 4
     max-in-flight: 16
-    max-mspt: 35.0
+    max-mspt: 28.0
     directional: true
     generate-new-chunks: false
 protection:

@@ -32,7 +32,7 @@ public final class VoidOptimize extends JavaPlugin {
     private final Set<String> chunksInFlight = ConcurrentHashMap.newKeySet();
     private final ConcurrentHashMap<UUID, Long> lastPlayerChunk = new ConcurrentHashMap<>();
     private long lastTickNanos, totalPassNanos, lastPassNanos, passes, entitiesInspected, protectedSeen;
-    private long skippedForLoad, chunkRequests, chunkCompletions, chunkFailures, lastChunkPrefetchNanos;
+    private long skippedForLoad, chunkRequests, chunkCompletions, chunkFailures, lastChunkPrefetchNanos, playerSamples;
     private long adaptiveReductions, adaptiveExpansions;
     private double lastMspt;
     private boolean emergencyMode;
@@ -94,7 +94,7 @@ public final class VoidOptimize extends JavaPlugin {
         updateEmergencyState();
         if (emergencyMode) { skippedForLoad++; return; }
         long start = System.nanoTime();
-        if (cullingEnabled) runSafeCulling();
+        if (cullingEnabled) samplePlayersWithoutEntityScan();
         if (chunkPrefetchEnabled && shouldPrefetchChunks()) runChunkPrefetch();
         lastPassNanos = System.nanoTime() - start;
         totalPassNanos += lastPassNanos;
@@ -103,41 +103,39 @@ public final class VoidOptimize extends JavaPlugin {
 
     private int adaptiveBudget() {
         if (!adaptiveEnabled) return maxEntitiesPerPass;
-        if (lastMspt >= conservativeMspt) return Math.max(minAdaptiveEntities, maxEntitiesPerPass / 3);
-        if (lastMspt >= aggressiveMspt) return Math.max(minAdaptiveEntities, (int)(maxEntitiesPerPass * 0.60));
-        if (lastMspt <= aggressiveMspt * 0.70) return Math.min(maxAdaptiveEntities, (int)(maxEntitiesPerPass * 1.25));
+        if (lastMspt >= conservativeMspt) return minAdaptiveEntities;
+        if (lastMspt >= aggressiveMspt) return Math.max(minAdaptiveEntities, maxEntitiesPerPass / 2);
+        if (lastMspt <= aggressiveMspt * 0.70) return Math.min(maxAdaptiveEntities, (int)(maxEntitiesPerPass * 1.15));
         return maxEntitiesPerPass;
     }
 
-    private void runSafeCulling() {
+    private void samplePlayersWithoutEntityScan() {
+        // This is intentionally O(players), not O(players * nearby entities).
+        // The previous entity scan inspected hundreds of entities without changing
+        // server state, so it could add load instead of removing it.
+        int players = Bukkit.getOnlinePlayers().size();
+        playerSamples += players;
         int budget = adaptiveBudget();
         if (budget < maxEntitiesPerPass) adaptiveReductions++;
         else if (budget > maxEntitiesPerPass) adaptiveExpansions++;
-        for (Player player : Bukkit.getOnlinePlayers()) {
-            if (budget <= 0 || !player.isOnline() || player.isDead()) break;
-            List<Entity> nearby;
-            try { nearby = player.getNearbyEntities(radius, radius, radius); } catch (Throwable ignored) { continue; }
-            for (Entity entity : nearby) {
-                if (budget-- <= 0) return;
-                if (!entity.isValid()) continue;
-                entitiesInspected++;
-                if (projectileProtection && isProtected(entity)) protectedSeen++;
-            }
-        }
     }
 
     private boolean shouldPrefetchChunks() {
         if (emergencyMode || Bukkit.getOnlinePlayers().isEmpty()) return false;
         long now = System.nanoTime();
         if (now - lastChunkPrefetchNanos < chunkPrefetchIntervalTicks * 50_000_000L) return false;
-        return lastMspt <= chunkPrefetchMaxMspt && chunksInFlight.size() < maxChunkRequestsInFlight;
+        int players = Bukkit.getOnlinePlayers().size();
+        int safeInFlight = Math.min(maxChunkRequestsInFlight, Math.max(2, 8 + players / 16));
+        return lastMspt <= chunkPrefetchMaxMspt && chunksInFlight.size() < safeInFlight;
     }
 
     private void runChunkPrefetch() {
         lastChunkPrefetchNanos = System.nanoTime();
         int requested = 0;
+        int players = Bukkit.getOnlinePlayers().size();
+        int requestBudget = Math.min(maxChunkRequestsPerPass, Math.max(1, 2 + players / 50));
         for (Player player : Bukkit.getOnlinePlayers()) {
-            if (requested >= maxChunkRequestsPerPass || chunksInFlight.size() >= maxChunkRequestsInFlight) break;
+            if (requested >= requestBudget || chunksInFlight.size() >= maxChunkRequestsInFlight) break;
             if (!player.isOnline() || player.isDead()) continue;
             World world = player.getWorld();
             int cx = player.getLocation().getBlockX() >> 4;
@@ -160,7 +158,7 @@ public final class VoidOptimize extends JavaPlugin {
                 candidates.add(new int[]{cx, cz + d}); candidates.add(new int[]{cx, cz - d});
             }
             for (int[] c : candidates) {
-                if (requested >= maxChunkRequestsPerPass || chunksInFlight.size() >= maxChunkRequestsInFlight) break;
+                if (requested >= requestBudget || chunksInFlight.size() >= maxChunkRequestsInFlight) break;
                 String key = world.getUID() + ":" + c[0] + ":" + c[1];
                 if (!chunksInFlight.add(key)) continue;
                 try {
@@ -216,6 +214,7 @@ public final class VoidOptimize extends JavaPlugin {
         s.sendMessage(ChatColor.GRAY + "Last pass: " + ChatColor.WHITE + String.format(Locale.ROOT,"%.3f ms",lastPassNanos/1_000_000.0) + ChatColor.GRAY + " | Average: " + ChatColor.WHITE + String.format(Locale.ROOT,"%.3f ms",averagePassMs()));
         s.sendMessage(ChatColor.GRAY + "Passes: " + ChatColor.WHITE + passes + ChatColor.GRAY + " | Inspected: " + entitiesInspected + ChatColor.GRAY + " | Protected: " + protectedSeen);
         s.sendMessage(ChatColor.GRAY + "Load skips: " + ChatColor.WHITE + skippedForLoad + ChatColor.GRAY + " | Adaptive reductions: " + adaptiveReductions + ChatColor.GRAY + " | Expansions: " + adaptiveExpansions);
+        s.sendMessage(ChatColor.GRAY + "Player samples: " + ChatColor.WHITE + playerSamples + ChatColor.GRAY + " | Plugin pass overhead: " + ChatColor.WHITE + String.format(Locale.ROOT,"%.3f ms",averagePassMs()));
         s.sendMessage(ChatColor.GRAY + "Chunks completed: " + ChatColor.WHITE + chunkCompletions + ChatColor.GRAY + " | Failed: " + chunkFailures);
     }
 

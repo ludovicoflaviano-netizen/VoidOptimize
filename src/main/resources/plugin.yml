@@ -1,10 +1,10 @@
 name: VoidOptimize
-version: 1.4.0
+version: 1.5.0
 main: com.voidoptimize.VoidOptimize
 api-version: '1.21'
 author: Ludovico
 website: https://github.com/ludovicoflaviano-netizen/VoidOptimize
-description: Safe Paper 1.21.11 optimization with adaptive workload control, guarded chunk prefetch, and a VoidionMC admin panel.
+description: Safe Paper 1.21.11 optimization with low-overhead adaptive scheduling, guarded chunk prefetch, and a VoidionMC admin panel.
 commands:
   voidoptimize:
     description: Open the VoidOptimize admin panel or view optimizer status.
