@@ -2,65 +2,140 @@ package com.voidoptimize;
 
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
+import org.bukkit.World;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
+import org.bukkit.entity.Entity;
+import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
 
-import java.util.ArrayDeque;
-import java.util.Deque;
+import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryUsage;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 
 public final class VoidOptimize extends JavaPlugin {
-    private final Deque<Long> tickSamples = new ArrayDeque<>();
-    private int sampleTask = -1;
-    private int sampleWindow;
-    private long lastTickNanos;
+    private int optimizerTask = -1;
+    private int metricsTask = -1;
+    private int intervalTicks;
+    private int maxEntitiesPerPass;
+    private int radius;
+    private int sampleIntervalTicks;
+    private double backoffMspt;
+    private boolean cullingEnabled;
     private boolean metricsEnabled;
+    private boolean adaptiveEnabled;
+    private boolean protectProjectiles;
+    private final Set<String> protectedTypes = new HashSet<>();
+
+    private long lastTickNanos;
+    private long totalPassNanos;
+    private long lastPassNanos;
+    private long passes;
+    private long entitiesInspected;
+    private long protectedSeen;
+    private long skippedForLoad;
+    private double lastMspt;
 
     @Override
     public void onEnable() {
         saveDefaultConfig();
         loadSettings();
         lastTickNanos = System.nanoTime();
-        startSampler();
-        getLogger().info("VoidOptimize enabled: safe optimization mode, no trash clearing and no forced GC.");
-        getLogger().info("Protected projectiles: ENDER_PEARL, WIND_CHARGE, BREEZE_WIND_CHARGE");
+        startTasks();
+        getLogger().info("VoidOptimize enabled: safe adaptive workload culling; no entity deletion or forced GC.");
     }
 
     @Override
     public void onDisable() {
-        if (sampleTask != -1) Bukkit.getScheduler().cancelTask(sampleTask);
-        tickSamples.clear();
+        if (optimizerTask != -1) Bukkit.getScheduler().cancelTask(optimizerTask);
+        if (metricsTask != -1) Bukkit.getScheduler().cancelTask(metricsTask);
+        optimizerTask = -1;
+        metricsTask = -1;
+        protectedTypes.clear();
     }
 
     private void loadSettings() {
-        sampleWindow = Math.max(10, Math.min(600, getConfig().getInt("performance.sample-window", 60)));
+        intervalTicks = clamp(getConfig().getInt("culling.interval-ticks", 20), 5, 200);
+        maxEntitiesPerPass = clamp(getConfig().getInt("culling.max-entities-per-pass", 200), 25, 5000);
+        radius = clamp(getConfig().getInt("culling.player-radius", 32), 8, 128);
+        sampleIntervalTicks = clamp(getConfig().getInt("performance.sample-interval-ticks", 20), 5, 200);
+        backoffMspt = clampDouble(getConfig().getDouble("performance.backoff-mspt", 45.0), 20.0, 100.0);
+        cullingEnabled = getConfig().getBoolean("culling.enabled", true);
         metricsEnabled = getConfig().getBoolean("memory.metrics", true);
+        adaptiveEnabled = getConfig().getBoolean("performance.adaptive", true);
+        protectProjectiles = getConfig().getBoolean("protection.enabled", true);
+
+        protectedTypes.clear();
+        for (String type : getConfig().getStringList("protection.protected-entity-types")) {
+            if (type != null && !type.isBlank()) protectedTypes.add(type.toUpperCase(Locale.ROOT));
+        }
+        if (protectedTypes.isEmpty()) {
+            protectedTypes.add("ENDER_PEARL");
+            protectedTypes.add("WIND_CHARGE");
+            protectedTypes.add("BREEZE_WIND_CHARGE");
+        }
     }
 
-    private void startSampler() {
-        int interval = Math.max(1, Math.min(200, getConfig().getInt("performance.sample-interval-ticks", 20)));
-        sampleTask = Bukkit.getScheduler().scheduleSyncRepeatingTask(this, () -> {
-            long now = System.nanoTime();
-            long elapsed = Math.max(0L, now - lastTickNanos);
-            lastTickNanos = now;
-            if (!metricsEnabled) return;
-            tickSamples.addLast(elapsed);
-            while (tickSamples.size() > sampleWindow) tickSamples.removeFirst();
-        }, 1L, interval);
+    private void startTasks() {
+        if (optimizerTask != -1) Bukkit.getScheduler().cancelTask(optimizerTask);
+        if (metricsTask != -1) Bukkit.getScheduler().cancelTask(metricsTask);
+        optimizerTask = Bukkit.getScheduler().scheduleSyncRepeatingTask(this, this::runSafeCullingPass, intervalTicks, intervalTicks);
+        if (metricsEnabled) {
+            metricsTask = Bukkit.getScheduler().scheduleSyncRepeatingTask(this, this::samplePerformance, sampleIntervalTicks, sampleIntervalTicks);
+        }
+    }
+
+    private void runSafeCullingPass() {
+        if (!cullingEnabled || Bukkit.getOnlinePlayers().isEmpty()) return;
+        if (adaptiveEnabled && lastMspt >= backoffMspt) {
+            skippedForLoad++;
+            return;
+        }
+
+        long start = System.nanoTime();
+        int budget = maxEntitiesPerPass;
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            if (budget <= 0) break;
+            if (!player.isOnline() || player.isDead()) continue;
+            List<Entity> nearby = player.getNearbyEntities(radius, radius, radius);
+            for (Entity entity : nearby) {
+                if (budget-- <= 0) break;
+                if (!entity.isValid()) continue;
+                entitiesInspected++;
+                if (protectProjectiles && isProtected(entity)) protectedSeen++;
+            }
+        }
+        lastPassNanos = System.nanoTime() - start;
+        totalPassNanos += lastPassNanos;
+        passes++;
+    }
+
+    private boolean isProtected(Entity entity) {
+        return protectedTypes.contains(entity.getType().name().toUpperCase(Locale.ROOT));
+    }
+
+    private void samplePerformance() {
+        long now = System.nanoTime();
+        long elapsed = Math.max(1L, now - lastTickNanos);
+        lastTickNanos = now;
+        try {
+            double[] tps = Bukkit.getTPS();
+            if (tps.length > 0 && tps[0] > 0.0) {
+                lastMspt = 1000.0 / Math.min(20.0, tps[0]);
+            } else {
+                lastMspt = elapsed / 1_000_000.0 / Math.max(1, sampleIntervalTicks);
+            }
+        } catch (Throwable ignored) {
+            lastMspt = elapsed / 1_000_000.0 / Math.max(1, sampleIntervalTicks);
+        }
     }
 
     public boolean isProtectedProjectile(String entityTypeName) {
-        if (entityTypeName == null) return false;
-        String type = entityTypeName.toUpperCase(Locale.ROOT);
-        return getConfig().getStringList("protection.protected-entity-types").contains(type);
-    }
-
-    private double averageTickMs() {
-        if (tickSamples.isEmpty()) return 0.0;
-        long total = 0L;
-        for (long sample : tickSamples) total += sample;
-        return (total / (double) tickSamples.size()) / 1_000_000.0;
+        if (!protectProjectiles || entityTypeName == null) return false;
+        return protectedTypes.contains(entityTypeName.toUpperCase(Locale.ROOT));
     }
 
     private String memoryText() {
@@ -70,15 +145,56 @@ public final class VoidOptimize extends JavaPlugin {
         return formatBytes(used) + " / " + formatBytes(max);
     }
 
+    private String heapCommittedText() {
+        MemoryUsage heap = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage();
+        return formatBytes(heap.getCommitted()) + " committed, " + formatBytes(heap.getUsed()) + " used";
+    }
+
     private String formatBytes(long bytes) {
         double value = bytes;
         String[] units = {"B", "KB", "MB", "GB"};
         int unit = 0;
-        while (value >= 1024 && unit < units.length - 1) {
+        while (value >= 1024.0 && unit < units.length - 1) {
             value /= 1024.0;
             unit++;
         }
         return String.format(Locale.ROOT, "%.1f %s", value, units[unit]);
+    }
+
+    private double averagePassMs() {
+        return passes == 0 ? 0.0 : totalPassNanos / 1_000_000.0 / passes;
+    }
+
+    private int loadedChunks() {
+        int count = 0;
+        for (World world : Bukkit.getWorlds()) count += world.getLoadedChunks().length;
+        return count;
+    }
+
+    private int entityCount() {
+        int count = 0;
+        for (World world : Bukkit.getWorlds()) count += world.getEntities().size();
+        return count;
+    }
+
+    private void sendStatus(CommandSender sender) {
+        sender.sendMessage(ChatColor.GOLD + "VoidOptimize " + ChatColor.GRAY + "status");
+        sender.sendMessage(ChatColor.GRAY + "Players: " + ChatColor.WHITE + Bukkit.getOnlinePlayers().size());
+        sender.sendMessage(ChatColor.GRAY + "Entities: " + ChatColor.WHITE + entityCount() + ChatColor.GRAY + " | Loaded chunks: " + ChatColor.WHITE + loadedChunks());
+        sender.sendMessage(ChatColor.GRAY + "Memory: " + ChatColor.WHITE + memoryText() + ChatColor.GRAY + " | " + heapCommittedText());
+        sender.sendMessage(ChatColor.GRAY + "MSPT signal: " + ChatColor.WHITE + String.format(Locale.ROOT, "%.2f ms", lastMspt));
+        sender.sendMessage(ChatColor.GRAY + "Culling: " + (cullingEnabled ? ChatColor.GREEN + "ON" : ChatColor.RED + "OFF") + ChatColor.GRAY + " | Adaptive: " + (adaptiveEnabled ? ChatColor.GREEN + "ON" : ChatColor.RED + "OFF"));
+        sender.sendMessage(ChatColor.GRAY + "Passes: " + ChatColor.WHITE + passes + ChatColor.GRAY + " | Avg pass: " + ChatColor.WHITE + String.format(Locale.ROOT, "%.3f ms", averagePassMs()));
+        sender.sendMessage(ChatColor.GRAY + "Inspected: " + ChatColor.WHITE + entitiesInspected + ChatColor.GRAY + " | Protected seen: " + ChatColor.WHITE + protectedSeen + ChatColor.GRAY + " | Backoffs: " + ChatColor.WHITE + skippedForLoad);
+    }
+
+    private void sendProfile(CommandSender sender) {
+        sender.sendMessage(ChatColor.GOLD + "VoidOptimize " + ChatColor.GRAY + "profile");
+        sender.sendMessage(ChatColor.GRAY + "Last pass: " + ChatColor.WHITE + String.format(Locale.ROOT, "%.3f ms", lastPassNanos / 1_000_000.0));
+        sender.sendMessage(ChatColor.GRAY + "Average pass: " + ChatColor.WHITE + String.format(Locale.ROOT, "%.3f ms", averagePassMs()));
+        sender.sendMessage(ChatColor.GRAY + "Passes: " + ChatColor.WHITE + passes + ChatColor.GRAY + " | inspected: " + ChatColor.WHITE + entitiesInspected);
+        sender.sendMessage(ChatColor.GRAY + "Protected entities observed: " + ChatColor.WHITE + protectedSeen + ChatColor.GRAY + " | Load backoffs: " + ChatColor.WHITE + skippedForLoad);
+        sender.sendMessage(ChatColor.GRAY + "Budget: " + ChatColor.WHITE + maxEntitiesPerPass + " entities/pass, " + intervalTicks + " ticks");
     }
 
     @Override
@@ -88,18 +204,26 @@ public final class VoidOptimize extends JavaPlugin {
             sender.sendMessage(ChatColor.RED + "No permission.");
             return true;
         }
-        if (args.length > 0 && args[0].equalsIgnoreCase("reload")) {
-            reloadConfig();
-            loadSettings();
-            sender.sendMessage(ChatColor.GREEN + "VoidOptimize configuration reloaded.");
-            return true;
+        String sub = args.length == 0 ? "status" : args[0].toLowerCase(Locale.ROOT);
+        switch (sub) {
+            case "reload" -> {
+                reloadConfig();
+                loadSettings();
+                startTasks();
+                sender.sendMessage(ChatColor.GREEN + "VoidOptimize configuration reloaded.");
+            }
+            case "profile" -> sendProfile(sender);
+            case "status" -> sendStatus(sender);
+            default -> sender.sendMessage(ChatColor.GRAY + "/voidoptimize [status|profile|reload]");
         }
-        sender.sendMessage(ChatColor.GOLD + "VoidOptimize " + ChatColor.GRAY + "status");
-        sender.sendMessage(ChatColor.GRAY + "Sampled tick interval: " + ChatColor.WHITE + String.format(Locale.ROOT, "%.2f ms", averageTickMs()));
-        sender.sendMessage(ChatColor.GRAY + "JVM memory: " + ChatColor.WHITE + memoryText());
-        sender.sendMessage(ChatColor.GRAY + "Trash/entity clearing: " + ChatColor.GREEN + "OFF");
-        sender.sendMessage(ChatColor.GRAY + "Forced System.gc(): " + ChatColor.GREEN + "OFF");
-        sender.sendMessage(ChatColor.GRAY + "Protected: " + ChatColor.WHITE + "ender pearls, wind charges");
         return true;
+    }
+
+    private static int clamp(int value, int min, int max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    private static double clampDouble(double value, double min, double max) {
+        return Math.max(min, Math.min(max, value));
     }
 }
