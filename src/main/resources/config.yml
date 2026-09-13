@@ -1,6 +1,4 @@
-# VoidOptimize - adaptive Paper 1.21.11 optimization
-# This plugin never deletes gameplay entities, never forces GC, and never disables the Paper watchdog.
-
+# VoidOptimize 1.4.0
 culling:
   enabled: true
   interval-ticks: 10
@@ -8,7 +6,6 @@ culling:
   min-adaptive-entities: 75
   max-adaptive-entities: 600
   player-radius: 32
-
 performance:
   adaptive: true
   sample-interval-ticks: 20
@@ -16,7 +13,6 @@ performance:
   resume-mspt: 35.0
   aggressive-mspt: 25.0
   conservative-mspt: 38.0
-
 chunks:
   prefetch:
     enabled: true
@@ -27,16 +23,16 @@ chunks:
     max-mspt: 35.0
     directional: true
     generate-new-chunks: false
-
 protection:
   enabled: true
   protected-entity-types:
     - ENDER_PEARL
     - WIND_CHARGE
     - BREEZE_WIND_CHARGE
-
 cleanup:
   enabled: false
-
 memory:
   metrics: true
+panel:
+  owner: VoidionMC
+  toggles: {}

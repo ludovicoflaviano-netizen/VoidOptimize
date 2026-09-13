@@ -5,6 +5,7 @@ import org.bukkit.ChatColor;
 import org.bukkit.World;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
+import org.bukkit.event.Listener;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -39,6 +40,7 @@ public final class VoidOptimize extends JavaPlugin {
     @Override public void onEnable() {
         saveDefaultConfig();
         loadSettings();
+        getServer().getPluginManager().registerEvents(new OptimizationPanel(this), this);
         lastTickNanos = System.nanoTime();
         startTasks();
         getLogger().info("VoidOptimize enabled: adaptive workload control, guarded chunk prefetch, and overload protection.");
@@ -221,15 +223,23 @@ public final class VoidOptimize extends JavaPlugin {
         if (!command.getName().equalsIgnoreCase("voidoptimize")) return false;
         if (!sender.hasPermission("voidoptimize.admin")) { sender.sendMessage(ChatColor.RED + "No permission."); return true; }
         String sub = args.length == 0 ? "status" : args[0].toLowerCase(Locale.ROOT);
+        if (sub.equals("panel") || sub.equals("gui")) {
+            if (sender instanceof Player p) new OptimizationPanel(this).open(p, 0);
+            else sender.sendMessage(ChatColor.RED + "The panel is in-game only.");
+            return true;
+        }
         switch (sub) {
             case "reload" -> { reloadConfig(); loadSettings(); startTasks(); sender.sendMessage(ChatColor.GREEN + "VoidOptimize configuration reloaded."); }
             case "profile" -> sendProfile(sender);
             case "status" -> sendStatus(sender);
-            default -> sender.sendMessage(ChatColor.GRAY + "/voidoptimize [status|profile|reload]");
+            default -> sender.sendMessage(ChatColor.GRAY + "/voidoptimize [panel|status|profile|reload]");
         }
         return true;
     }
 
     private static int clamp(int v,int min,int max){return Math.max(min,Math.min(max,v));}
     private static double clampDouble(double v,double min,double max){return Math.max(min,Math.min(max,v));}
+    public double getLastMsptForPanel() { return lastMspt; }
+    public boolean isEmergencyForPanel() { return emergencyMode; }
+
 }
