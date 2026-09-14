@@ -1,25 +1,23 @@
-# VoidOptimize 1.5.0
+# VoidOptimize 2.0
+# Gameplay-safe adaptive profile for Paper 1.21.11.
 culling:
-  enabled: true
-  interval-ticks: 20
-  max-entities-per-pass: 200
-  min-adaptive-entities: 50
-  max-adaptive-entities: 400
-  player-radius: 24
+  enabled: false
+  interval-ticks: 40
 performance:
   adaptive: true
   sample-interval-ticks: 20
   emergency-mspt: 45.0
-  resume-mspt: 32.0
-  aggressive-mspt: 25.0
-  conservative-mspt: 36.0
+  high-player-mspt: 24.0
+  resume-mspt: 20.0
+memory:
+  metrics: true
 chunks:
   prefetch:
     enabled: true
     interval-ticks: 10
     radius: 1
-    max-requests-per-pass: 4
-    max-in-flight: 16
+    max-requests-per-pass: 3
+    max-in-flight: 12
     max-mspt: 28.0
     directional: true
     generate-new-chunks: false
@@ -29,10 +27,6 @@ protection:
     - ENDER_PEARL
     - WIND_CHARGE
     - BREEZE_WIND_CHARGE
-cleanup:
-  enabled: false
-memory:
-  metrics: true
 panel:
   owner: VoidionMC
   toggles: {}
